@@ -35,6 +35,7 @@ def get_mnist_data_loaders(batch_size=32, flatten=False, drop_last=True, only_cl
     # build transforms
     img_transformation = transforms.Compose([
         transforms.ToTensor(),
+        # transforms.Normalize((0.1307,), (0.3081,)),
     ])
     if img_size < 28 and img_size >= 24:
         img_transformation.transforms.append(transforms.Resize(img_size))
