@@ -1,6 +1,8 @@
 import os
 import torch
+import torch.nn.functional as F
 from torchvision import datasets, transforms
+from torch.utils.data import Dataset
 import numpy as np
 import random
 
@@ -16,13 +18,106 @@ g = torch.Generator()
 g.manual_seed(0)
 
 
-def randomize_targets(X, y, noise=0.1, n_classes=10):
-    X_noisy = X.clone()
-    y_noisy = y.clone()
-    for i in range(len(y)):
-        if random.random() < noise:
-            y_noisy[i] = random.choice([c_i for c_i in range(0, n_classes) if c_i is not y_noisy[i].item()])
-    return X_noisy, y_noisy
+class RandomLinearProjectionMNIST(Dataset):
+    def __init__(
+        self,
+        orig_mnist_dataset,
+        num_tasks=10,
+        seq_len=10,
+        permuted_images_frac=1.0,
+        permuted_labels_frac=1.0,
+        labels_shifted_by_one=False,
+        spare_mem=False,
+    ):
+        self.orig_mnist_dataset = orig_mnist_dataset
+        self.num_tasks = num_tasks
+        self.seq_len = seq_len
+        self.labels_shifted_by_one = labels_shifted_by_one
+        self.spare_mem = spare_mem
+
+        self.task_idxs = []
+        self.lin_transforms = []
+        self.label_perms = []
+        for task_idx in range(self.num_tasks):
+            # randomly sample a subset of the MNIST dataset
+            # task = torch.utils.data.Subset(orig_mnist_dataset, torch.randperm(len(orig_mnist_dataset))[:self.seq_len])
+            task_dataset_idxs = torch.randperm(len(orig_mnist_dataset))[:self.seq_len]
+            self.task_idxs.append(task_dataset_idxs)
+            
+            # generate random linear projections for each task
+            if np.random.rand() < permuted_images_frac:
+                if self.spare_mem: # save only the random seed
+                    lin_tranform = task_idx
+                else:
+                    lin_tranform = torch.normal(0, 1/784, (784, 784))
+            else:
+                if self.spare_mem:
+                    lin_tranform = None
+                else:
+                    lin_tranform = torch.eye(784)
+            self.lin_transforms.append(lin_tranform)
+
+            # generate random label permutations for each task
+            if np.random.rand() < permuted_labels_frac:
+                label_perm = torch.randperm(10)
+            else:
+                label_perm = torch.arange(10)
+            self.label_perms.append(label_perm)
+    
+    def __len__(self):
+        return self.num_tasks
+    
+    def __getitem__(self, idx):
+        # get the task and projection for the given index
+        task = self.get_task(idx)
+        lin_tranform = self.get_lin_transform(idx)
+        label_perm = self.label_perms[idx] # (10,)
+
+        x, y = [], []
+        for example in task:
+            # standardized projection
+            proj = (lin_tranform @ example[0].view(784)) # (784,)
+            proj = (proj - proj.mean()) / (proj.std() + 1e-16)
+            # permuted label
+            perm_label = label_perm[example[1]]
+            x.append(proj)
+            y.append(perm_label)
+        
+        x = torch.stack(x)
+        y = torch.stack(y)
+        # concatenate the projected images and permuted labels
+        if self.labels_shifted_by_one:
+            # append labels to images ((x1,0), (x2,y1), ..., (xn-1, yn-2), (xn, yn-1)) - all except the first one
+            y_shifted = torch.cat((torch.zeros(size=(1, 10)), F.one_hot(y[:-1], num_classes=10)), dim=0) # (seq_len, 10)
+            x = torch.concat((x, y_shifted), dim=1) # (seq_len, 784 + 10), y (seq_len,)
+        else:
+            # append labels to images ((x1,y1), (x2,y2), ..., (xn-1, yn-1), (xn, 0)) - all except the last one
+            y_masked_last = torch.cat((F.one_hot(y[:-1], num_classes=10), torch.zeros(size=(1, 10))), dim=0) # (seq_len, 10)
+            x = torch.concat((x, y_masked_last), dim=1)
+            y = y[-1] # (10,)
+
+        return x, y # (seq_len, 784 + 10), (seq_len,) if self.labels_shifted_by_one else (1,)
+
+    def get_lin_transform(self, task_idx):
+        if self.spare_mem: # storing only the random seed
+            if self.lin_transforms[task_idx] is None:
+                lin_tranform = torch.eye(784)
+            else:
+                lin_tranform = torch.normal(0, 1/784, (784, 784), generator=torch.Generator().manual_seed(self.lin_transforms[task_idx]))
+        else:
+            lin_tranform = self.lin_transforms[task_idx] # (784, 784)
+        return lin_tranform
+
+    def get_task(self, task_idx):
+        task_idxs = self.task_idxs[task_idx]
+        return torch.utils.data.Subset(self.orig_mnist_dataset, task_idxs)
+
+    @staticmethod
+    def get_default_transform():
+        return transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,)),
+        ])
 
 
 def select_from_classes(x, y, classes_to_select):
@@ -35,7 +130,7 @@ def get_mnist_data_loaders(batch_size=32, flatten=False, drop_last=True, only_cl
     # build transforms
     img_transformation = transforms.Compose([
         transforms.ToTensor(),
-        # transforms.Normalize((0.1307,), (0.3081,)),
+        transforms.Normalize((0.1307,), (0.3081,)),
     ])
     if img_size < 28 and img_size >= 24:
         img_transformation.transforms.append(transforms.Resize(img_size))
