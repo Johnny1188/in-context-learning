@@ -41,7 +41,10 @@ class RandomLinearProjectionMNIST(Dataset):
         for task_idx in range(self.num_tasks):
             # randomly sample a subset of the MNIST dataset
             # task = torch.utils.data.Subset(orig_mnist_dataset, torch.randperm(len(orig_mnist_dataset))[:self.seq_len])
-            task_dataset_idxs = torch.randperm(len(orig_mnist_dataset))[:self.seq_len]
+            if self.spare_mem: # save only the random seed
+                task_dataset_idxs = task_idx
+            else:
+                task_dataset_idxs = torch.randperm(len(orig_mnist_dataset))[:self.seq_len]
             self.task_idxs.append(task_dataset_idxs)
             
             # generate random linear projections for each task
@@ -59,9 +62,15 @@ class RandomLinearProjectionMNIST(Dataset):
 
             # generate random label permutations for each task
             if np.random.rand() < permuted_labels_frac:
-                label_perm = torch.randperm(10)
+                if self.spare_mem:
+                    label_perm = task_idx
+                else:
+                    label_perm = torch.randperm(10)
             else:
-                label_perm = torch.arange(10)
+                if self.spare_mem:
+                    label_perm = None
+                else:
+                    label_perm = torch.arange(10)
             self.label_perms.append(label_perm)
     
     def __len__(self):
@@ -69,9 +78,9 @@ class RandomLinearProjectionMNIST(Dataset):
     
     def __getitem__(self, idx):
         # get the task and projection for the given index
-        task = self.get_task(idx)
-        lin_tranform = self.get_lin_transform(idx)
-        label_perm = self.label_perms[idx] # (10,)
+        task = self.get_task(idx) # torch.utils.data.Subset # (seq_len, 2)
+        lin_tranform = self.get_lin_transform(idx) # (784, 784)
+        label_perm = self.get_label_perm(idx) # (10,)
 
         x, y = [], []
         for example in task:
@@ -98,6 +107,16 @@ class RandomLinearProjectionMNIST(Dataset):
 
         return x, y # (seq_len, 784 + 10), (seq_len,) if self.labels_shifted_by_one else (1,)
 
+    def get_label_perm(self, task_idx):
+        if self.spare_mem: # storing only the random seed
+            if self.label_perms[task_idx] is None:
+                label_perm = torch.arange(10)
+            else:
+                label_perm = torch.randperm(10, generator=torch.Generator().manual_seed(self.label_perms[task_idx]))
+        else:
+            label_perm = self.label_perms[task_idx]
+        return label_perm
+
     def get_lin_transform(self, task_idx):
         if self.spare_mem: # storing only the random seed
             if self.lin_transforms[task_idx] is None:
@@ -109,8 +128,13 @@ class RandomLinearProjectionMNIST(Dataset):
         return lin_tranform
 
     def get_task(self, task_idx):
-        task_idxs = self.task_idxs[task_idx]
-        return torch.utils.data.Subset(self.orig_mnist_dataset, task_idxs)
+        if self.spare_mem: # storing only the random seed
+            task_idxs = torch.randperm(len(self.orig_mnist_dataset), 
+                generator=torch.Generator().manual_seed(self.task_idxs[task_idx]))[:self.seq_len]
+        else:
+            task_idxs = self.task_idxs[task_idx]
+        return [self.orig_mnist_dataset[i] for i in task_idxs]
+        # return torch.utils.data.Subset(self.orig_mnist_dataset, task_idxs)
 
     @staticmethod
     def get_default_transform():
